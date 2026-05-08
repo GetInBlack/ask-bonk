@@ -11,6 +11,10 @@
     },
   ],
   "compatibility_flags": ["nodejs_compat"],
+  // Webhook traffic is served via the bonk.infra.inblack.app custom domain;
+  // no need to expose the workers.dev URL or per-version preview URLs.
+  "workers_dev": false,
+  "preview_urls": false,
   // Build-time constants replaced by esbuild. Deploy script overrides with real values.
   "define": {
     "__VERSION__": "\"dev\"",
