@@ -10,6 +10,8 @@ import {
 import {
   extractRepoFromClaims,
   extractBearerToken,
+  authorizeTokenExchangeClaims,
+  authorizeCrossRepoTarget,
   handleExchangeTokenForRepo,
   handleExchangeTokenWithPAT,
   resolvePermissions,
@@ -394,6 +396,72 @@ describe("Authorization Header Parsing", () => {
     expect(extractBearerToken("Basic token123")).toBeNull();
     expect(extractBearerToken(null)).toBeNull();
     expect(extractBearerToken(undefined)).toBeNull();
+  });
+});
+
+describe("Token Exchange Workflow Authorization", () => {
+  const claims = {
+    repository: "GetInBlack/inblack-platform",
+    job_workflow_ref:
+      "GetInBlack/inblack-platform/.github/workflows/bonk.yml@refs/heads/main",
+    event_name: "pull_request",
+  } as any;
+
+  it("accepts the repository's Bonk workflow on main", () => {
+    expect(authorizeTokenExchangeClaims(claims).isOk()).toBe(true);
+  });
+
+  it.each([
+    ["another workflow", { job_workflow_ref: "GetInBlack/inblack-platform/.github/workflows/ci.yml@refs/heads/main" }],
+    ["a pull-request branch", { job_workflow_ref: "GetInBlack/inblack-platform/.github/workflows/bonk.yml@refs/pull/42/merge" }],
+    ["another repository", { job_workflow_ref: "GetInBlack/inblack-cloud/.github/workflows/bonk.yml@refs/heads/main" }],
+    ["an unsupported event", { event_name: "push" }],
+  ])("rejects %s", (_label, override) => {
+    const result = authorizeTokenExchangeClaims({ ...claims, ...override });
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) expect(result.error.reason).toBe("workflow");
+  });
+
+  it("accepts an explicitly configured workflow path only on main", () => {
+    const scheduled = {
+      ...claims,
+      job_workflow_ref:
+        "GetInBlack/inblack-platform/.github/workflows/bonk-scheduled.yml@refs/heads/main",
+      event_name: "schedule",
+    };
+    expect(
+      authorizeTokenExchangeClaims(
+        scheduled,
+        ".github/workflows/bonk.yml,.github/workflows/bonk-scheduled.yml",
+      ).isOk(),
+    ).toBe(true);
+  });
+});
+
+describe("Cross-Repo Target Authorization", () => {
+  it.each(["private", "internal"])(
+    "denies token exchange for a different %s repository",
+    (visibility) => {
+      const result = authorizeCrossRepoTarget(
+        "GetInBlack/inblack-platform",
+        "GetInBlack/inblack-cloud",
+        "private",
+        visibility,
+      );
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) expect(result.error.reason).toBe("visibility");
+    },
+  );
+
+  it("allows a public cross-repository target", () => {
+    expect(
+      authorizeCrossRepoTarget(
+        "GetInBlack/inblack-platform",
+        "GetInBlack/public-docs",
+        "private",
+        "public",
+      ).isOk(),
+    ).toBe(true);
   });
 });
 

@@ -29,6 +29,10 @@ export interface Env {
   // Enable PAT-to-installation-token exchange (for local development/testing)
   // Set to "true" to enable - disabled by default in production
   ENABLE_PAT_EXCHANGE?: string;
+  // Comma-separated workflow paths authorized to exchange GitHub OIDC tokens.
+  // Defaults to .github/workflows/bonk.yml; every path is bound to the
+  // requesting repository and refs/heads/main by the service.
+  BONK_ALLOWED_WORKFLOW_PATHS?: string;
   // Maximum workflow tracking time in seconds. Defaults to 21600 (6 hours,
   // the GitHub Actions workflow-level maximum). You're unlikely to need to
   // reduce this; set it higher only for self-hosted runners with custom limits.

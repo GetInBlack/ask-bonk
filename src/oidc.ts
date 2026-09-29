@@ -18,6 +18,17 @@ import { RETRY_CONFIG, APP_INSTALLATION_CACHE_TTL_SECS } from "./constants";
 // GitHub's OIDC token issuer for Actions
 const GITHUB_ACTIONS_ISSUER = "https://token.actions.githubusercontent.com";
 
+const DEFAULT_BONK_WORKFLOW_PATH = ".github/workflows/bonk.yml";
+const ALLOWED_BONK_EVENTS = new Set([
+  "issue_comment",
+  "pull_request_review_comment",
+  "pull_request_review",
+  "issues",
+  "pull_request",
+  "workflow_dispatch",
+  "schedule",
+]);
+
 const JWKS = createRemoteJWKSet(new URL(`${GITHUB_ACTIONS_ISSUER}/.well-known/jwks`));
 
 // JWT claims from GitHub Actions OIDC token
@@ -87,6 +98,44 @@ export function extractRepoFromClaims(
     );
   }
   return Result.ok({ owner: parts[0], repo: parts[1] });
+}
+
+// Authorizes the signed GitHub claims for token exchange. Signature and
+// audience validation alone prove only that some job in the repository asked
+// GitHub for a token; this binds the exchange to an explicitly allowed Bonk
+// workflow definition on the default branch and to events the action handles.
+export function authorizeTokenExchangeClaims(
+  claims: GitHubActionsJWTClaims,
+  allowedWorkflowPaths?: string,
+): Result<void, AuthorizationError> {
+  const configuredPaths = (allowedWorkflowPaths ?? DEFAULT_BONK_WORKFLOW_PATH)
+    .split(",")
+    .map((path) => path.trim())
+    .filter(Boolean);
+  const paths = configuredPaths.length > 0 ? configuredPaths : [DEFAULT_BONK_WORKFLOW_PATH];
+  const expectedRefs = new Set(
+    paths.map((path) => `${claims.repository}/${path}@refs/heads/main`),
+  );
+
+  if (!expectedRefs.has(claims.job_workflow_ref)) {
+    return Result.err(
+      new AuthorizationError({
+        message: "Token exchange denied: workflow is not an authorized Bonk workflow on main",
+        reason: "workflow",
+      }),
+    );
+  }
+
+  if (!ALLOWED_BONK_EVENTS.has(claims.event_name)) {
+    return Result.err(
+      new AuthorizationError({
+        message: `Token exchange denied: unsupported Bonk event ${claims.event_name}`,
+        reason: "workflow",
+      }),
+    );
+  }
+
+  return Result.ok(undefined);
 }
 
 // Extracts bearer token from Authorization header.
@@ -262,6 +311,38 @@ const PERMISSION_PRESETS: Record<TokenPermissionPreset, Required<TokenPermission
   WRITE: { ...DEFAULT_TOKEN_PERMISSIONS },
 };
 
+const READ_ONLY_TOKEN_PERMISSIONS: Required<TokenPermissions> = {
+  contents: "read",
+  issues: "read",
+  pull_requests: "read",
+  metadata: "read",
+};
+
+export function authorizeCrossRepoTarget(
+  sourceRepository: string,
+  targetRepository: string,
+  sourceVisibility: string,
+  targetVisibility: string,
+): Result<void, AuthorizationError> {
+  if (sourceVisibility === "public" && targetVisibility !== "public") {
+    return Result.err(
+      new AuthorizationError({
+        message: "Cross-repo access denied: public repos cannot access private/internal repos",
+        reason: "visibility",
+      }),
+    );
+  }
+  if (sourceRepository !== targetRepository && targetVisibility !== "public") {
+    return Result.err(
+      new AuthorizationError({
+        message: "Cross-repo access denied: private/internal repositories do not accept cross-repository token exchange",
+        reason: "visibility",
+      }),
+    );
+  }
+  return Result.ok(undefined);
+}
+
 const PERMISSION_RANK: Record<string, number> = { read: 0, write: 1 };
 
 // Resolves a TokenPermissionsInput (preset name or custom object) into a
@@ -407,6 +488,14 @@ export async function handleExchangeToken(
   }
   const claims = validationResult.value;
 
+  const workflowAuthorization = authorizeTokenExchangeClaims(
+    claims,
+    env.BONK_ALLOWED_WORKFLOW_PATHS,
+  );
+  if (workflowAuthorization.isErr()) {
+    return Result.err(workflowAuthorization.error);
+  }
+
   // Extract repository info from claims
   const repoResult = extractRepoFromClaims(claims);
   if (repoResult.isErr()) {
@@ -466,7 +555,8 @@ export async function handleExchangeToken(
 //
 // Security controls:
 // 1. Same-org restriction: The target repo must be in the same org/user as the source repo
-// 2. Visibility restriction: Public repos cannot access private repos (prevents data exfiltration)
+// 2. Visibility restriction: Cross-repository exchange is allowed only to a
+//    public target. Private/internal targets are fail-closed.
 // 3. Actor write access: The actor (user who triggered the workflow) must have write access to the target repo
 export async function handleExchangeTokenForRepo(
   env: Env,
@@ -489,6 +579,14 @@ export async function handleExchangeTokenForRepo(
     return Result.err(validationResult.error);
   }
   const claims = validationResult.value;
+
+  const workflowAuthorization = authorizeTokenExchangeClaims(
+    claims,
+    env.BONK_ALLOWED_WORKFLOW_PATHS,
+  );
+  if (workflowAuthorization.isErr()) {
+    return Result.err(workflowAuthorization.error);
+  }
 
   // Target repo must be specified in body
   if (!body.owner || !body.repo) {
@@ -551,14 +649,17 @@ export async function handleExchangeTokenForRepo(
   // Generate tokens for security checks
   return Result.tryPromise({
     try: async () => {
-      const sourceToken = await generateInstallationToken(env, sourceInstallationId);
-      const targetToken = await generateInstallationToken(env, targetInstallationId, {
+      const sourceToken = await generateInstallationToken(env, sourceInstallationId, {
+        repositoryNames: [sourceRepoName],
+        permissions: READ_ONLY_TOKEN_PERMISSIONS,
+      });
+      const targetInspectionToken = await generateInstallationToken(env, targetInstallationId, {
         repositoryNames: [targetRepoName],
-        permissions: { ...DEFAULT_TOKEN_PERMISSIONS },
+        permissions: READ_ONLY_TOKEN_PERMISSIONS,
       });
 
       const sourceOctokit = new Octokit({ auth: sourceToken });
-      const targetOctokit = new Octokit({ auth: targetToken });
+      const targetOctokit = new Octokit({ auth: targetInspectionToken });
 
       // Security check 2: Visibility restriction
       // Octokit types `visibility` as `string`; the GitHub API only returns
@@ -566,16 +667,21 @@ export async function handleExchangeTokenForRepo(
       // narrow it. We compare against the string literal directly.
       const sourceData = await getRepository(sourceOctokit, sourceOwner, sourceRepoName);
       const targetData = await getRepository(targetOctokit, targetOwner, targetRepoName);
+      const sourceVisibility = sourceData.visibility ?? (sourceData.private ? "private" : "public");
+      const targetVisibility = targetData.visibility ?? (targetData.private ? "private" : "public");
 
-      if (sourceData.visibility === "public" && targetData.visibility !== "public") {
+      const targetAuthorization = authorizeCrossRepoTarget(
+        sourceRepo,
+        targetRepo,
+        sourceVisibility,
+        targetVisibility,
+      );
+      if (targetAuthorization.isErr()) {
         crossRepoLog.warn("cross_repo_denied_visibility", {
-          source_visibility: sourceData.visibility,
-          target_visibility: targetData.visibility,
+          source_visibility: sourceVisibility,
+          target_visibility: targetVisibility,
         });
-        throw new AuthorizationError({
-          message: "Cross-repo access denied: public repos cannot access private/internal repos",
-          reason: "visibility",
-        });
+        throw targetAuthorization.error;
       }
 
       // Security check 3: Actor write access
@@ -588,14 +694,20 @@ export async function handleExchangeTokenForRepo(
         });
       }
 
+      const targetToken = await generateInstallationToken(env, targetInstallationId, {
+        repositoryNames: [targetRepoName],
+        permissions: { ...DEFAULT_TOKEN_PERMISSIONS },
+      });
+
       // Audit log: successful cross-repo token issuance
       crossRepoLog.info("cross_repo_token_issued", {
         source_installation_id: sourceInstallationId,
         source_installation_source: sourceInstallationSource,
         target_installation_id: targetInstallationId,
         target_installation_source: targetInstallationSource,
-        source_visibility: sourceData.visibility,
-        target_visibility: targetData.visibility,
+        source_visibility: sourceVisibility,
+        target_visibility: targetVisibility,
+        issued_permissions: DEFAULT_TOKEN_PERMISSIONS,
         run_id: claims.run_id,
         workflow: claims.job_workflow_ref,
       });

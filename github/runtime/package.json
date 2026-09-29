@@ -1,0 +1,7 @@
+{
+  "name": "ask-bonk-action-runtime",
+  "private": true,
+  "dependencies": {
+    "opencode-ai": "1.18.31"
+  }
+}

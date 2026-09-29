@@ -176,6 +176,13 @@ The default workflow triggers on `issue_comment` and `pull_request_review_commen
 
 By default, Bonk's installation token has full write access. Use `token_permissions` to restrict what the agent can do -- useful for review-only workflows where the agent should never push code.
 
+The token service accepts exchanges only from `.github/workflows/bonk.yml` on
+`refs/heads/main` and only for events the action handles. A deployment that
+uses other workflow filenames must set `BONK_ALLOWED_WORKFLOW_PATHS` to a
+comma-separated allowlist; each configured path remains bound to the calling
+repository and `main`. Cross-repository exchanges to private or internal
+repositories are refused.
+
 ```yaml
 # Review-only: can comment and suggest, cannot push
 - name: Run Bonk
