@@ -171,6 +171,7 @@ runs:
 
     - name: Configure Git
       if: success() && steps.mentions.outputs.skip != 'true' && steps.preflight.outputs.skip != 'true'
+      id: configure_git
       shell: bash
       env:
         TOKEN_PERMISSIONS: ${{ inputs.token_permissions }}
@@ -191,6 +192,7 @@ runs:
         normalized_permissions="$(printf '%s' "${normalized_permissions}" | tr '[:lower:]' '[:upper:]')"
         if [ "${normalized_permissions}" = "NO_PUSH" ]; then
           git remote set-url origin "${server_url}/${GITHUB_REPOSITORY}.git"
+          echo "read_only=true" >> "${GITHUB_OUTPUT}"
         elif [ -n "${GH_TOKEN:-}" ]; then
           # Write-capable runs use the App token so pushes trigger downstream
           # workflows; actions/checkout's GITHUB_TOKEN does not do so.
@@ -205,6 +207,23 @@ runs:
       shell: bash
       run: |
         set +e
+        if [ "${READ_ONLY_GIT}" = "true" ]; then
+          # Scope read authentication to this step. Reset any inherited
+          # credential helpers, require the exact repository path and use a
+          # trusted helper that refuses every other protocol/host/repository.
+          export GIT_CONFIG_COUNT=4
+          export GIT_CONFIG_KEY_0="credential.helper"
+          export GIT_CONFIG_VALUE_0=""
+          export GIT_CONFIG_KEY_1="credential.useHttpPath"
+          export GIT_CONFIG_VALUE_1="true"
+          export GIT_CONFIG_KEY_2="core.askPass"
+          export GIT_CONFIG_VALUE_2="/bin/false"
+          export GIT_CONFIG_KEY_3="credential.helper"
+          export GIT_CONFIG_VALUE_3="!${GITHUB_ACTION_PATH}/script/git-credential-readonly.ts"
+          export GIT_ASKPASS=/bin/false
+          export SSH_ASKPASS=/bin/false
+          export GIT_TERMINAL_PROMPT=0
+        fi
         # GH_TOKEN is the App token written to GITHUB_ENV by the OIDC exchange step.
         export USE_GITHUB_TOKEN=true
         export GITHUB_TOKEN="${GH_TOKEN}"
@@ -220,6 +239,7 @@ runs:
         SHARE: false
         MENTIONS: ${{ inputs.mentions }}
         OIDC_BASE_URL: ${{ inputs.oidc_base_url }}
+        READ_ONLY_GIT: ${{ steps.configure_git.outputs.read_only }}
         # Expose the PR/issue number so OpenCode (and any shell commands the
         # model runs, e.g. `gh api .../pulls/$PR_NUMBER/reviews`) can
         # reference the correct PR without having to infer it from git or

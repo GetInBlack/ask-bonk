@@ -6,6 +6,7 @@ import action from "../github/action.yml?raw";
 import runtimePackageText from "../github/runtime/package.json?raw";
 // @ts-expect-error raw asset import
 import runtimeLock from "../github/runtime/bun.lock?raw";
+import { buildCredentialResponse } from "../github/script/git-credential-readonly";
 
 const runtimePackage = JSON.parse(runtimePackageText);
 
@@ -53,6 +54,7 @@ describe("GitHub action dependency integrity", () => {
     expect(configureGit).toContain(
       'git remote set-url origin "${server_url}/${GITHUB_REPOSITORY}.git"',
     );
+    expect(configureGit).toContain('echo "read_only=true" >> "${GITHUB_OUTPUT}"');
     expect(configureGit).toContain('elif [ -n "${GH_TOKEN:-}" ]; then');
 
     const noPushBranch = configureGit!.indexOf(
@@ -70,13 +72,85 @@ describe("GitHub action dependency integrity", () => {
     const tokenizedRemote = configureGit!.indexOf(
       'git remote set-url origin "https://x-access-token:${GH_TOKEN}@${host}/${GITHUB_REPOSITORY}.git"',
     );
+    const readOnlyOutput = configureGit!.indexOf('echo "read_only=true" >> "${GITHUB_OUTPUT}"');
     expect(configureGit!.match(/x-access-token:\$\{GH_TOKEN\}/g)).toHaveLength(1);
     expect(extraheaderRemoval).toBeGreaterThan(-1);
     expect(extraheaderRemoval).toBeLessThan(noPushBranch);
     expect(noPushBranch).toBeGreaterThan(-1);
     expect(credentialFreeRemote).toBeGreaterThan(noPushBranch);
+    expect(readOnlyOutput).toBeGreaterThan(credentialFreeRemote);
+    expect(readOnlyOutput).toBeLessThan(writeBranch);
     expect(credentialFreeRemote).toBeLessThan(writeBranch);
     expect(writeBranch).toBeGreaterThan(noPushBranch);
     expect(tokenizedRemote).toBeGreaterThan(writeBranch);
+  });
+
+  it("scopes the read-only credential helper to the OpenCode step", () => {
+    const runOpenCode = action.match(
+      /    - name: Run opencode[\s\S]*?(?=\n    - name: Finalize Bonk run)/,
+    )?.[0];
+
+    expect(runOpenCode).toBeDefined();
+    expect(runOpenCode).toContain("READ_ONLY_GIT: ${{ steps.configure_git.outputs.read_only }}");
+    const readOnlyBlock = runOpenCode!.match(
+      /        if \[ "\$\{READ_ONLY_GIT\}" = "true" \]; then\n([\s\S]*?)\n        fi/,
+    )?.[1];
+    expect(readOnlyBlock).toBeDefined();
+    expect(readOnlyBlock).toContain('export GIT_CONFIG_VALUE_0=""');
+    expect(readOnlyBlock).toContain('export GIT_CONFIG_KEY_1="credential.useHttpPath"');
+    expect(readOnlyBlock).toContain('export GIT_CONFIG_KEY_2="core.askPass"');
+    expect(readOnlyBlock).toContain('export GIT_CONFIG_VALUE_2="/bin/false"');
+    expect(readOnlyBlock).toContain(
+      'export GIT_CONFIG_VALUE_3="!${GITHUB_ACTION_PATH}/script/git-credential-readonly.ts"',
+    );
+    expect(readOnlyBlock).toContain("export GIT_ASKPASS=/bin/false");
+    expect(readOnlyBlock).toContain("export SSH_ASKPASS=/bin/false");
+    expect(readOnlyBlock).toContain("export GIT_TERMINAL_PROMPT=0");
+    expect(runOpenCode).not.toContain('>> "${GITHUB_ENV}"');
+  });
+
+  it("returns the dedicated token only for the exact GitHub repository", () => {
+    const environment = {
+      GH_TOKEN: "dummy-read-only-token",
+      GITHUB_REPOSITORY: "GetInBlack/private-repo",
+      GITHUB_SERVER_URL: "https://github.com",
+    };
+    const valid = "protocol=https\nhost=github.com\npath=GetInBlack/private-repo.git\n\n";
+
+    expect(buildCredentialResponse("get", valid, environment)).toBe(
+      "username=x-access-token\npassword=dummy-read-only-token\n\n",
+    );
+    expect(
+      buildCredentialResponse(
+        "get",
+        "protocol=https\nhost=attacker.example\npath=GetInBlack/private-repo.git\n\n",
+        environment,
+      ),
+    ).toBeNull();
+    expect(
+      buildCredentialResponse(
+        "get",
+        "protocol=https\nhost=github.com\npath=attacker/repo.git\n\n",
+        environment,
+      ),
+    ).toBeNull();
+    expect(
+      buildCredentialResponse(
+        "get",
+        "protocol=http\nhost=github.com\npath=GetInBlack/private-repo.git\n\n",
+        environment,
+      ),
+    ).toBeNull();
+    expect(
+      buildCredentialResponse("get", valid, { ...environment, GH_TOKEN: undefined }),
+    ).toBeNull();
+    expect(
+      buildCredentialResponse("get", valid, {
+        ...environment,
+        GH_TOKEN: undefined,
+        GITHUB_TOKEN: "broader-caller-token",
+      } as typeof environment & { GITHUB_TOKEN: string }),
+    ).toBeNull();
+    expect(buildCredentialResponse("store", valid, environment)).toBe("");
   });
 });
