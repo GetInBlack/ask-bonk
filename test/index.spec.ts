@@ -10,6 +10,9 @@ import {
 import {
   extractRepoFromClaims,
   extractBearerToken,
+  authorizeTokenExchangeClaims,
+  verifyTokenExchangeWorkflowDefinition,
+  authorizeCrossRepoTarget,
   handleExchangeTokenForRepo,
   handleExchangeTokenWithPAT,
   resolvePermissions,
@@ -55,6 +58,7 @@ function createMockEnv(overrides: Partial<Env> = {}): Env {
         prop === "CLOUDFLARE_ACCOUNT_ID" ||
         prop === "ANALYTICS_TOKEN" ||
         prop === "ENABLE_PAT_EXCHANGE" ||
+        prop === "BONK_ALLOWED_WORKFLOW_PATHS" ||
         prop === "BONK_MAX_TRACK_SECS"
       ) {
         return undefined;
@@ -348,6 +352,7 @@ describe("OIDC Claim Parsing", () => {
       actor: "octocat",
       actor_id: "789",
       workflow: "CI",
+      workflow_ref: "octocat/hello-world/.github/workflows/ci.yml@refs/heads/main",
       event_name: "push",
       ref: "refs/heads/main",
       ref_type: "branch",
@@ -394,6 +399,194 @@ describe("Authorization Header Parsing", () => {
     expect(extractBearerToken("Basic token123")).toBeNull();
     expect(extractBearerToken(null)).toBeNull();
     expect(extractBearerToken(undefined)).toBeNull();
+  });
+});
+
+describe("Token Exchange Workflow Authorization", () => {
+  const claims = {
+    repository: "GetInBlack/inblack-platform",
+    workflow_ref: "GetInBlack/inblack-platform/.github/workflows/bonk.yml@refs/heads/main",
+    event_name: "issue_comment",
+    ref: "refs/heads/main",
+  } as any;
+
+  it("accepts the repository's Bonk workflow on main", () => {
+    expect(authorizeTokenExchangeClaims(claims).isOk()).toBe(true);
+  });
+
+  it("fails closed when required workflow claims are missing", () => {
+    const result = authorizeTokenExchangeClaims({ ...claims, workflow_ref: undefined } as any);
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) expect(result.error.reason).toBe("workflow");
+  });
+
+  it.each([
+    [
+      "another workflow",
+      { workflow_ref: "GetInBlack/inblack-platform/.github/workflows/ci.yml@refs/heads/main" },
+    ],
+    [
+      "another repository",
+      { workflow_ref: "GetInBlack/inblack-cloud/.github/workflows/bonk.yml@refs/heads/main" },
+    ],
+    ["an unsupported event", { event_name: "push" }],
+  ])("rejects %s", (_label, override) => {
+    const result = authorizeTokenExchangeClaims({ ...claims, ...override });
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) expect(result.error.reason).toBe("workflow");
+  });
+
+  it("accepts an explicitly configured workflow path only on main", () => {
+    const scheduled = {
+      ...claims,
+      workflow_ref:
+        "GetInBlack/inblack-platform/.github/workflows/bonk-scheduled.yml@refs/heads/main",
+      event_name: "schedule",
+    };
+    expect(
+      authorizeTokenExchangeClaims(
+        scheduled,
+        ".github/workflows/bonk.yml,.github/workflows/bonk-scheduled.yml",
+      ).isOk(),
+    ).toBe(true);
+  });
+
+  it("does not accept a reusable-workflow claim in place of the calling workflow", () => {
+    const result = authorizeTokenExchangeClaims({
+      ...claims,
+      workflow_ref: "GetInBlack/inblack-platform/.github/workflows/ci.yml@refs/heads/main",
+      job_workflow_ref: "GetInBlack/inblack-platform/.github/workflows/bonk.yml@refs/heads/main",
+    });
+    expect(result.isErr()).toBe(true);
+  });
+
+  it("accepts a pull-request workflow only when signed claims bind it to main", () => {
+    const result = authorizeTokenExchangeClaims({
+      ...claims,
+      workflow_ref: "GetInBlack/inblack-platform/.github/workflows/bonk.yml@refs/pull/42/merge",
+      workflow_sha: "a".repeat(40),
+      event_name: "pull_request_review_comment",
+      ref: "refs/pull/42/merge",
+      base_ref: "main",
+    });
+
+    expect(result.isOk()).toBe(true);
+    if (result.isOk()) {
+      expect(result.value).toEqual({
+        workflowPath: ".github/workflows/bonk.yml",
+        source: "pull_request",
+        workflowSha: "a".repeat(40),
+      });
+    }
+  });
+
+  it.each([
+    ["a non-PR event", { event_name: "issue_comment" }],
+    ["a mismatched ref", { ref: "refs/pull/43/merge" }],
+    ["a non-main base", { base_ref: "release" }],
+    ["a missing workflow SHA", { workflow_sha: undefined }],
+  ])("rejects a pull-request workflow with %s", (_label, override) => {
+    const result = authorizeTokenExchangeClaims({
+      ...claims,
+      workflow_ref: "GetInBlack/inblack-platform/.github/workflows/bonk.yml@refs/pull/42/merge",
+      workflow_sha: "a".repeat(40),
+      event_name: "pull_request_review_comment",
+      ref: "refs/pull/42/merge",
+      base_ref: "main",
+      ...override,
+    });
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) expect(result.error.reason).toBe("workflow");
+  });
+
+  it("verifies a pull-request workflow is byte-identical to trusted main", async () => {
+    const refs: string[] = [];
+    const result = await verifyTokenExchangeWorkflowDefinition(
+      {
+        workflowPath: ".github/workflows/bonk.yml",
+        source: "pull_request",
+        workflowSha: "a".repeat(40),
+      },
+      async (_path, ref) => {
+        refs.push(ref);
+        return "same-blob-sha";
+      },
+    );
+
+    expect(result.isOk()).toBe(true);
+    expect(refs).toEqual(["a".repeat(40), "refs/heads/main"]);
+  });
+
+  it("rejects a pull-request workflow changed from trusted main", async () => {
+    const result = await verifyTokenExchangeWorkflowDefinition(
+      {
+        workflowPath: ".github/workflows/bonk.yml",
+        source: "pull_request",
+        workflowSha: "a".repeat(40),
+      },
+      async (_path, ref) => (ref === "refs/heads/main" ? "trusted" : "changed"),
+    );
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) expect(result.error.reason).toBe("workflow");
+  });
+
+  it("rejects empty workflow blob identities", async () => {
+    const result = await verifyTokenExchangeWorkflowDefinition(
+      {
+        workflowPath: ".github/workflows/bonk.yml",
+        source: "pull_request",
+        workflowSha: "a".repeat(40),
+      },
+      async () => "",
+    );
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) expect(result.error.reason).toBe("workflow");
+  });
+
+  it("fails closed when workflow provenance cannot be loaded", async () => {
+    const result = await verifyTokenExchangeWorkflowDefinition(
+      {
+        workflowPath: ".github/workflows/bonk.yml",
+        source: "pull_request",
+        workflowSha: "a".repeat(40),
+      },
+      async () => {
+        throw new Error("GitHub unavailable");
+      },
+    );
+
+    expect(result.isErr()).toBe(true);
+    if (result.isErr()) expect(GitHubAPIError.is(result.error)).toBe(true);
+  });
+});
+
+describe("Cross-Repo Target Authorization", () => {
+  it.each(["private", "internal"])(
+    "denies token exchange for a different %s repository",
+    (visibility) => {
+      const result = authorizeCrossRepoTarget(
+        "GetInBlack/inblack-platform",
+        "GetInBlack/inblack-cloud",
+        "private",
+        visibility,
+      );
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) expect(result.error.reason).toBe("visibility");
+    },
+  );
+
+  it("allows a public cross-repository target", () => {
+    expect(
+      authorizeCrossRepoTarget(
+        "GetInBlack/inblack-platform",
+        "GetInBlack/public-docs",
+        "private",
+        "public",
+      ).isOk(),
+    ).toBe(true);
   });
 });
 

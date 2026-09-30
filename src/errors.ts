@@ -12,6 +12,7 @@ export class AuthorizationError extends TaggedError("AuthorizationError")<{
     | "missing_header"
     | "invalid_format"
     | "invalid_token"
+    | "workflow"
     | "cross_org"
     | "visibility"
     | "no_write_access";

@@ -97,6 +97,12 @@ ae_queries/              # SQL queries for /stats Analytics Engine endpoints
 
 OIDC is the most security-critical path. All `/api/github/*` endpoints are protected by OIDC token validation.
 
+Token exchange authorizes the caller's `workflow_ref`, not
+`job_workflow_ref` (which identifies only a called reusable workflow). Runs on
+`refs/pull/<number>/merge` must carry a matching signed ref, target `main`, and
+prove that the workflow file at `workflow_sha` has the same Git blob SHA as the
+allowlisted workflow on `main` before any write-capable token is created.
+
 ### Endpoint Protection Pattern
 
 Every authenticated endpoint follows this sequence:
@@ -121,7 +127,8 @@ When adding new authenticated endpoints, follow this exact pattern. The claims-v
 `handleExchangeTokenForRepo()` enforces three layered checks before issuing a token for a different repo:
 
 1. **Same-org check**: requesting and target repos must be in the same GitHub org
-2. **Visibility check**: a public repo cannot request a token for a private repo
+2. **Visibility check**: cross-repository exchange is limited to public targets;
+   private and internal target repositories are refused
 3. **Actor write access**: the workflow actor must have write access to the target repo
 
 Each check has structured audit logging. Follow this pattern for any future cross-repo features.
@@ -145,9 +152,9 @@ mentions.skip != true  AND  preflight.skip != true  [AND additional per-step con
 | Step | Condition | Key Behavior |
 |------|-----------|--------------|
 | 1. Check mentions | always | Matches comment body against trigger phrases; short-circuits workflow on miss |
-| 2. Setup bun | mentions passed | Installs bun 1.3 |
+| 2. Setup bun | mentions passed | Installs pinned Bun 1.3.14 via a SHA-pinned action |
 | 3. Pre-flight orchestration | mentions passed | Single `bun run orchestrate.ts` consolidating 7 formerly separate steps |
-| 4. Install opencode | preflight passed | `bun install -g opencode-ai@latest` |
+| 4. Install opencode | preflight passed | Frozen install of OpenCode 1.18.31 from `github/runtime/bun.lock` |
 | 5. Configure Git | preflight passed | Sets bot identity, **replaces git credential with App token** |
 | 6. Run opencode | preflight passed + fork check | `timeout 45m` with `set +e` to capture exit code |
 | 7. Finalize | `if: always()` when preflight passed | Reports status; **never calls `setFailed()`** |
@@ -286,7 +293,7 @@ All domain errors are `TaggedError` subclasses in `src/errors.ts`. Use `.is()` f
 | Error | Use Case |
 |-------|----------|
 | `OIDCValidationError` | JWT validation failures |
-| `AuthorizationError` | 6 reason variants: `missing_header`, `invalid_format`, `invalid_token`, `cross_org`, `visibility`, `no_write_access` |
+| `AuthorizationError` | 7 reason variants: `missing_header`, `invalid_format`, `invalid_token`, `workflow`, `cross_org`, `visibility`, `no_write_access` |
 | `InstallationNotFoundError` | App not installed for owner/repo |
 | `ValidationError` | Input validation with optional `field` |
 | `NotFoundError` | Resource not found with `resource` and `id` |
