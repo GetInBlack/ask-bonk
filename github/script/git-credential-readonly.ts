@@ -15,7 +15,13 @@ function parseCredentialInput(input: string): Map<string, string> | null {
     const separator = line.indexOf("=");
     if (separator <= 0) return null;
     const key = line.slice(0, separator);
-    if (fields.has(key)) return null;
+    // Git credential protocol v2 uses repeated `[]` keys for capabilities
+    // and authentication challenges. Keep rejecting duplicate scalar fields
+    // so an ambiguous protocol/host/path still fails closed.
+    if (fields.has(key)) {
+      if (!key.endsWith("[]")) return null;
+      continue;
+    }
     fields.set(key, line.slice(separator + 1));
   }
   return fields;

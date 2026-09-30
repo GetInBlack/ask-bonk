@@ -38,7 +38,9 @@ credential_fill() (
 )
 
 valid_output="$(
-  printf 'protocol=https\nhost=github.com\npath=GetInBlack/private-repo.git\n\n' |
+  # Git 2.51 sends repeated credential-protocol v2 capabilities before the
+  # scalar identity fields and may add a WWW-Authenticate challenge.
+  printf 'capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=github.com\npath=GetInBlack/private-repo.git\nwwwauth[]=Basic realm="GitHub"\n\n' |
     credential_fill
 )"
 case "${valid_output}" in
