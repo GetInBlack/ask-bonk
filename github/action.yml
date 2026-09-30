@@ -172,18 +172,28 @@ runs:
     - name: Configure Git
       if: success() && steps.mentions.outputs.skip != 'true' && steps.preflight.outputs.skip != 'true'
       shell: bash
+      env:
+        TOKEN_PERMISSIONS: ${{ inputs.token_permissions }}
       run: |
+        set -euo pipefail
         git config --global user.name "ask-bonk[bot]"
         git config --global user.email "ask-bonk[bot]@users.noreply.github.com"
-        # Replace the GITHUB_TOKEN credential that actions/checkout persists in
-        # local git config. Pushes authenticated with GITHUB_TOKEN don't trigger
-        # downstream workflows (by design). The App installation token obtained
-        # via OIDC exchange does trigger them.
-        if [ -n "${GH_TOKEN}" ]; then
-          server_url="${GITHUB_SERVER_URL:-https://github.com}"
-          host="${server_url#https://}"
-          host="${host#http://}"
-          git config --unset-all "http.${server_url}/.extraheader" 2>/dev/null || true
+        server_url="${GITHUB_SERVER_URL:-https://github.com}"
+        host="${server_url#https://}"
+        host="${host#http://}"
+        git config --unset-all "http.${server_url}/.extraheader" 2>/dev/null || true
+
+        # NO_PUSH still needs GH_TOKEN for review comments, but it must not leave
+        # that short-lived App token in .git/config where tools can read it.
+        normalized_permissions="${TOKEN_PERMISSIONS}"
+        normalized_permissions="${normalized_permissions#"${normalized_permissions%%[![:space:]]*}"}"
+        normalized_permissions="${normalized_permissions%"${normalized_permissions##*[![:space:]]}"}"
+        normalized_permissions="$(printf '%s' "${normalized_permissions}" | tr '[:lower:]' '[:upper:]')"
+        if [ "${normalized_permissions}" = "NO_PUSH" ]; then
+          git remote set-url origin "${server_url}/${GITHUB_REPOSITORY}.git"
+        elif [ -n "${GH_TOKEN:-}" ]; then
+          # Write-capable runs use the App token so pushes trigger downstream
+          # workflows; actions/checkout's GITHUB_TOKEN does not do so.
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@${host}/${GITHUB_REPOSITORY}.git"
         fi
 
