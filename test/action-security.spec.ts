@@ -116,10 +116,22 @@ describe("GitHub action dependency integrity", () => {
       GITHUB_SERVER_URL: "https://github.com",
     };
     const valid = "protocol=https\nhost=github.com\npath=GetInBlack/private-repo.git\n\n";
+    const gitCredentialV2 =
+      'capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=github.com\npath=GetInBlack/private-repo.git\nwwwauth[]=Basic realm="GitHub"\n\n';
 
     expect(buildCredentialResponse("get", valid, environment)).toBe(
       "username=x-access-token\npassword=dummy-read-only-token\n\n",
     );
+    expect(buildCredentialResponse("get", gitCredentialV2, environment)).toBe(
+      "username=x-access-token\npassword=dummy-read-only-token\n\n",
+    );
+    expect(
+      buildCredentialResponse(
+        "get",
+        "protocol=https\nprotocol=http\nhost=github.com\npath=GetInBlack/private-repo.git\n\n",
+        environment,
+      ),
+    ).toBeNull();
     expect(
       buildCredentialResponse(
         "get",
