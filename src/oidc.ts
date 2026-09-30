@@ -28,6 +28,11 @@ const ALLOWED_BONK_EVENTS = new Set([
   "workflow_dispatch",
   "schedule",
 ]);
+const PULL_REQUEST_WORKFLOW_EVENTS = new Set([
+  "pull_request",
+  "pull_request_review",
+  "pull_request_review_comment",
+]);
 
 const JWKS = createRemoteJWKSet(new URL(`${GITHUB_ACTIONS_ISSUER}/.well-known/jwks`));
 
@@ -51,12 +56,15 @@ export interface GitHubActionsJWTClaims {
   actor: string;
   actor_id: string;
   workflow: string;
+  workflow_ref: string;
+  workflow_sha?: string;
   head_ref?: string;
   base_ref?: string;
   event_name: string;
   ref: string;
   ref_type: string;
-  job_workflow_ref: string;
+  job_workflow_ref?: string;
+  job_workflow_sha?: string;
   runner_environment: string;
 }
 
@@ -103,33 +111,110 @@ export function extractRepoFromClaims(
 // Authorizes the signed GitHub claims for token exchange. Signature and
 // audience validation alone prove only that some job in the repository asked
 // GitHub for a token; this binds the exchange to an explicitly allowed Bonk
-// workflow definition on the default branch and to events the action handles.
+// workflow definition on main and to events the action handles. Pull-request
+// refs require a second, API-backed check proving the workflow file's blob is
+// identical to the trusted file on main before any write token is issued.
+export interface TokenExchangeWorkflowAuthorization {
+  workflowPath: string;
+  source: "main" | "pull_request";
+  workflowSha?: string;
+}
+
 export function authorizeTokenExchangeClaims(
   claims: GitHubActionsJWTClaims,
   allowedWorkflowPaths?: string,
-): Result<void, AuthorizationError> {
-  const configuredPaths = (allowedWorkflowPaths ?? DEFAULT_BONK_WORKFLOW_PATH)
-    .split(",")
-    .map((path) => path.trim())
-    .filter(Boolean);
-  const paths = configuredPaths.length > 0 ? configuredPaths : [DEFAULT_BONK_WORKFLOW_PATH];
-  const expectedRefs = new Set(
-    paths.map((path) => `${claims.repository}/${path}@refs/heads/main`),
-  );
-
-  if (!expectedRefs.has(claims.job_workflow_ref)) {
+): Result<TokenExchangeWorkflowAuthorization, AuthorizationError> {
+  if (
+    typeof claims.repository !== "string" ||
+    typeof claims.workflow_ref !== "string" ||
+    typeof claims.event_name !== "string"
+  ) {
     return Result.err(
       new AuthorizationError({
-        message: "Token exchange denied: workflow is not an authorized Bonk workflow on main",
+        message: "Token exchange denied: required workflow claims are missing",
         reason: "workflow",
       }),
     );
   }
 
+  const configuredPaths = (allowedWorkflowPaths ?? DEFAULT_BONK_WORKFLOW_PATH)
+    .split(",")
+    .map((path) => path.trim())
+    .filter(Boolean);
+  const paths = configuredPaths.length > 0 ? configuredPaths : [DEFAULT_BONK_WORKFLOW_PATH];
   if (!ALLOWED_BONK_EVENTS.has(claims.event_name)) {
     return Result.err(
       new AuthorizationError({
         message: `Token exchange denied: unsupported Bonk event ${claims.event_name}`,
+        reason: "workflow",
+      }),
+    );
+  }
+
+  for (const workflowPath of paths) {
+    const expectedPrefix = `${claims.repository}/${workflowPath}@`;
+    if (!claims.workflow_ref.startsWith(expectedPrefix)) continue;
+
+    const workflowRef = claims.workflow_ref.slice(expectedPrefix.length);
+    if (workflowRef === "refs/heads/main") {
+      return Result.ok({ workflowPath, source: "main" });
+    }
+
+    if (!/^refs\/pull\/[1-9]\d*\/merge$/.test(workflowRef)) continue;
+    if (!PULL_REQUEST_WORKFLOW_EVENTS.has(claims.event_name)) continue;
+    if (claims.ref !== workflowRef) continue;
+    if (claims.base_ref !== "main" && claims.base_ref !== "refs/heads/main") continue;
+    if (!claims.workflow_sha || !/^[0-9a-f]{40}$/i.test(claims.workflow_sha)) continue;
+
+    return Result.ok({
+      workflowPath,
+      source: "pull_request",
+      workflowSha: claims.workflow_sha,
+    });
+  }
+
+  return Result.err(
+    new AuthorizationError({
+      message:
+        "Token exchange denied: workflow is not an authorized Bonk workflow on main or a verified pull-request workflow",
+      reason: "workflow",
+    }),
+  );
+}
+
+type WorkflowFileShaLoader = (path: string, ref: string) => Promise<string>;
+
+export async function verifyTokenExchangeWorkflowDefinition(
+  authorization: TokenExchangeWorkflowAuthorization,
+  loadWorkflowFileSha: WorkflowFileShaLoader,
+): Promise<Result<void, AuthorizationError | GitHubAPIError>> {
+  if (authorization.source === "main") return Result.ok(undefined);
+
+  if (!authorization.workflowSha) {
+    return Result.err(
+      new AuthorizationError({
+        message: "Token exchange denied: pull-request workflow SHA is missing",
+        reason: "workflow",
+      }),
+    );
+  }
+
+  const workflowShas = await Result.tryPromise({
+    try: () =>
+      Promise.all([
+        loadWorkflowFileSha(authorization.workflowPath, authorization.workflowSha as string),
+        loadWorkflowFileSha(authorization.workflowPath, "refs/heads/main"),
+      ]),
+    catch: (cause) =>
+      new GitHubAPIError({ operation: "verifyTokenExchangeWorkflowDefinition", cause }),
+  });
+  if (workflowShas.isErr()) return Result.err(workflowShas.error);
+
+  const [workflowSha, mainWorkflowSha] = workflowShas.value;
+  if (!workflowSha || !mainWorkflowSha || workflowSha !== mainWorkflowSha) {
+    return Result.err(
+      new AuthorizationError({
+        message: "Token exchange denied: pull-request workflow differs from trusted main",
         reason: "workflow",
       }),
     );
@@ -335,7 +420,8 @@ export function authorizeCrossRepoTarget(
   if (sourceRepository !== targetRepository && targetVisibility !== "public") {
     return Result.err(
       new AuthorizationError({
-        message: "Cross-repo access denied: private/internal repositories do not accept cross-repository token exchange",
+        message:
+          "Cross-repo access denied: private/internal repositories do not accept cross-repository token exchange",
         reason: "visibility",
       }),
     );
@@ -433,6 +519,20 @@ async function generateInstallationToken(
   return result.value.token;
 }
 
+async function getWorkflowFileSha(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string,
+): Promise<string> {
+  const response = await octokit.repos.getContent({ owner, repo, path, ref });
+  if (Array.isArray(response.data) || response.data.type !== "file") {
+    throw new Error(`Expected ${path} at ${ref} to be a workflow file`);
+  }
+  return response.data.sha;
+}
+
 // Response types for API endpoints
 export interface GetInstallationResponse {
   installation: {
@@ -488,13 +588,14 @@ export async function handleExchangeToken(
   }
   const claims = validationResult.value;
 
-  const workflowAuthorization = authorizeTokenExchangeClaims(
+  const workflowAuthorizationResult = authorizeTokenExchangeClaims(
     claims,
     env.BONK_ALLOWED_WORKFLOW_PATHS,
   );
-  if (workflowAuthorization.isErr()) {
-    return Result.err(workflowAuthorization.error);
+  if (workflowAuthorizationResult.isErr()) {
+    return Result.err(workflowAuthorizationResult.error);
   }
+  const workflowAuthorization = workflowAuthorizationResult.value;
 
   // Extract repository info from claims
   const repoResult = extractRepoFromClaims(claims);
@@ -521,6 +622,21 @@ export async function handleExchangeToken(
 
   return Result.tryPromise({
     try: async () => {
+      if (workflowAuthorization.source === "pull_request") {
+        const inspectionToken = await generateInstallationToken(env, installationId, {
+          repositoryNames: [repo],
+          permissions: READ_ONLY_TOKEN_PERMISSIONS,
+        });
+        const inspectionOctokit = new Octokit({ auth: inspectionToken });
+        const workflowVerification = await verifyTokenExchangeWorkflowDefinition(
+          workflowAuthorization,
+          (path, ref) => getWorkflowFileSha(inspectionOctokit, owner, repo, path, ref),
+        );
+        if (workflowVerification.isErr()) throw workflowVerification.error;
+      }
+
+      // A write-capable token is never minted before pull-request workflow
+      // provenance has been checked against the trusted file on main.
       const token = await generateInstallationToken(env, installationId, {
         repositoryNames: [repo],
         permissions,
@@ -537,6 +653,7 @@ export async function handleExchangeToken(
       return { token };
     },
     catch: (err) => {
+      if (AuthorizationError.is(err) || GitHubAPIError.is(err)) return err;
       exchangeLog.errorWithException("token_generation_failed", err, {
         installation_id: installationId,
         installation_source: installationSource,
@@ -580,13 +697,14 @@ export async function handleExchangeTokenForRepo(
   }
   const claims = validationResult.value;
 
-  const workflowAuthorization = authorizeTokenExchangeClaims(
+  const workflowAuthorizationResult = authorizeTokenExchangeClaims(
     claims,
     env.BONK_ALLOWED_WORKFLOW_PATHS,
   );
-  if (workflowAuthorization.isErr()) {
-    return Result.err(workflowAuthorization.error);
+  if (workflowAuthorizationResult.isErr()) {
+    return Result.err(workflowAuthorizationResult.error);
   }
+  const workflowAuthorization = workflowAuthorizationResult.value;
 
   // Target repo must be specified in body
   if (!body.owner || !body.repo) {
@@ -661,6 +779,12 @@ export async function handleExchangeTokenForRepo(
       const sourceOctokit = new Octokit({ auth: sourceToken });
       const targetOctokit = new Octokit({ auth: targetInspectionToken });
 
+      const workflowVerification = await verifyTokenExchangeWorkflowDefinition(
+        workflowAuthorization,
+        (path, ref) => getWorkflowFileSha(sourceOctokit, sourceOwner, sourceRepoName, path, ref),
+      );
+      if (workflowVerification.isErr()) throw workflowVerification.error;
+
       // Security check 2: Visibility restriction
       // Octokit types `visibility` as `string`; the GitHub API only returns
       // "public" | "private" | "internal" but the generated types don't
@@ -709,7 +833,7 @@ export async function handleExchangeTokenForRepo(
         target_visibility: targetVisibility,
         issued_permissions: DEFAULT_TOKEN_PERMISSIONS,
         run_id: claims.run_id,
-        workflow: claims.job_workflow_ref,
+        workflow: claims.workflow_ref,
       });
 
       return { token: targetToken };

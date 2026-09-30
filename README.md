@@ -176,12 +176,16 @@ The default workflow triggers on `issue_comment` and `pull_request_review_commen
 
 By default, Bonk's installation token has full write access. Use `token_permissions` to restrict what the agent can do -- useful for review-only workflows where the agent should never push code.
 
-The token service accepts exchanges only from `.github/workflows/bonk.yml` on
-`refs/heads/main` and only for events the action handles. A deployment that
-uses other workflow filenames must set `BONK_ALLOWED_WORKFLOW_PATHS` to a
-comma-separated allowlist; each configured path remains bound to the calling
-repository and `main`. Cross-repository exchanges to private or internal
-repositories are refused.
+The token service accepts exchanges only from `.github/workflows/bonk.yml` and
+only for events the action handles. Main-branch runs must use
+`refs/heads/main`. Pull-request review events may use GitHub's
+`refs/pull/<number>/merge` ref, but the service first proves that the workflow
+file at the signed `workflow_sha` is byte-identical to the trusted file on
+`main`; any difference or lookup failure is refused before a write-capable
+token is minted. A deployment that uses other workflow filenames must set
+`BONK_ALLOWED_WORKFLOW_PATHS` to a comma-separated allowlist. Each configured
+path remains bound to the calling repository and the same provenance checks.
+Cross-repository exchanges to private or internal repositories are refused.
 
 ```yaml
 # Review-only: can comment and suggest, cannot push
@@ -205,7 +209,9 @@ Custom objects are merged with the defaults and each permission is clamped to th
 
 #### Version Pinning
 
-By default, Bonk installs the latest OpenCode release. If a release is broken, you can pin to a known-good version:
+Bonk's action runtime pins OpenCode to `1.18.31` and installs it from the
+checked-in frozen lockfile. The `opencode_version` input remains visible for
+compatibility, but the action refuses values other than the pinned version:
 
 ```yaml
 - name: Run Bonk
@@ -214,12 +220,13 @@ By default, Bonk installs the latest OpenCode release. If a release is broken, y
     OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
   with:
     model: "opencode/claude-opus-4-5"
-    opencode_version: "1.2.16"
+    opencode_version: "1.18.31"
 ```
 
-Accepts a semver string (e.g., `"1.2.16"`, `"1.2.16-beta.1"`), `"latest"`, or `"dev"`. Invalid input (including `v`-prefixed versions, incomplete versions, or strings containing shell metacharacters) silently falls back to `"latest"` with a warning in the workflow log.
-
-The `opencode_dev` input takes precedence over `opencode_version` -- setting `opencode_dev: "true"` always installs from the dev channel regardless of the pinned version.
+`opencode_dev: "true"` is also refused by the immutable action runtime. Updating
+OpenCode requires changing `github/runtime/package.json`, regenerating and
+reviewing `github/runtime/bun.lock`, and updating the pinned value in
+`github/action.yml` together.
 
 #### Scheduled Tasks
 
@@ -320,8 +327,8 @@ Bonk is configured via your workflow file and OpenCode's config. There are no bu
 | `mentions`           | Comma-separated triggers (e.g., `/bonk,@ask-bonk`)                               | No       |
 | `permissions`        | Required permission: `admin`, `write`, `any`, or `CODEOWNERS`                    | No       |
 | `token_permissions`  | Scope the installation token: `NO_PUSH`, `WRITE`, or JSON                        | No       |
-| `opencode_version`   | Pin to a specific OpenCode version (e.g., `"1.2.16"`). Defaults to `"latest"`.   | No       |
-| `opencode_dev`       | Install from the dev channel instead of latest release (`"true"` / `"false"`)    | No       |
+| `opencode_version`   | Compatibility input; only the pinned `"1.18.31"` runtime is accepted             | No       |
+| `opencode_dev`       | Compatibility input; `"true"` is refused by the immutable runtime                | No       |
 | `agent`              | OpenCode agent to use                                                            | No       |
 | `prompt`             | Custom prompt (for scheduled/dispatch workflows)                                 | No       |
 

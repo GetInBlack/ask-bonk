@@ -51,7 +51,7 @@ inputs:
     default: "1.18.31"
 
   opencode_dev:
-    description: "Install OpenCode from dev branch instead of latest release"
+    description: "Compatibility input; 'true' is refused by the immutable action runtime"
     required: false
     default: "false"
 

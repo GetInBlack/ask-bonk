@@ -304,7 +304,7 @@ function resolveVersion(): void {
   const resolvedVersion = validateOpenCodeVersion(rawVersion);
   if (rawVersion && rawVersion.trim() !== resolvedVersion && resolvedVersion === "latest") {
     core.warning(
-      `Invalid opencode_version "${rawVersion}" — falling back to "latest". Use a semver string (e.g. "1.2.16") or "latest".`,
+      `Invalid opencode_version "${rawVersion}" — normalized to "latest". The immutable action runtime will refuse it; use the action-pinned version "1.18.31".`,
     );
   }
   core.setOutput("opencode_version", resolvedVersion);
