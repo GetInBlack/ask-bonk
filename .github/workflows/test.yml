@@ -24,3 +24,6 @@ jobs:
 
       - name: Run tests
         run: bun test
+
+      - name: Test fail-closed Git credentials
+        run: ./test/git-credential-integration.sh
